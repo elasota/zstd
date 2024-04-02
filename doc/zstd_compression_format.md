@@ -1149,10 +1149,10 @@ If this process results in a non-zero probability for a value outside of the
 valid range of values that the FSE table is defined for, even if that value is
 not used, then the data is considered corrupted.
 
-Then the decoder can tell how many bytes were used in this process,
-and how many symbols are present.
-The bitstream consumes a round number of bytes.
-Any remaining bits within the last byte are unused.
+Once all probabilities are decoded, the decoder can tell how many bytes were
+used in this process and how many symbols are present. Probability decoding
+consumes a whole number of bytes, any remaining unused bits in the last
+byte to be read by probability decoding is unused.
 
 #### From normalized distribution to decoding tables
 
