@@ -1065,68 +1065,86 @@ To decode FSE streams, it is necessary to construct the decoding table.
 The Zstandard format encodes FSE table descriptions as follows:
 
 An FSE distribution table describes the probabilities of all symbols
-from `0` to the last present one (included)
-on a normalized scale of `1 << Accuracy_Log` .
-Note that there must be two or more symbols with nonzero probability.
+from `0` to the last present one (included) on a normalized scale of
+`1 << Accuracy_Log` . Note that there must be two or more symbols
+with nonzero probability.
 
-It's a bitstream which is read forward, in __little-endian__ fashion.
-It's not necessary to know bitstream exact size,
-it will be discovered and reported by the decoding process.
+FSE tables are decoded from a bitstream which is read forward, in
+__little-endian__ fashion.  It's not necessary to know bitstream exact
+size, it will be discovered and reported by the decoding process.
 
 The bitstream starts by reporting on which scale it operates.
-Let's `low4Bits` designate the lowest 4 bits of the first byte :
+Let `low4Bits` designate the lowest 4 bits of the first byte :
 `Accuracy_Log = low4bits + 5`.
 
-Then follows each symbol value, from `0` to last present one.
+Then follows the probability of each symbol, from `0` to last present one.
 The number of bits used by each field is variable.
-It depends on :
 
-- Remaining probabilities + 1 :
-  __example__ :
-  Presuming an `Accuracy_Log` of 8,
-  and presuming 100 probabilities points have already been distributed,
-  the decoder may read any value from `0` to `256 - 100 + 1 == 157` (inclusive).
-  Therefore, it may read up to `log2sup(157) == 8` bits, where `log2sup(N)`
-  is the smallest integer `T` that satisfies `(1 << T) > N`.
+The following algorithm describes the process for decoding each probability value:
 
-- Value decoded : small values use 1 less bit :
-  __example__ :
+Let `Cumulative_Prob = Sum of Effective_Prob for all previously decoded symbols`.
+If `Cumulative_Prob` is equal to `(1 << Accuracy_Log)`, then decoding is complete
+and no more probabilities are decoded.
+
+Let `Max_Prob_Value = (1 << Accuracy_Log) - Cumulative_Prob + 1`
+
+Let `Prob_Base_Size` = The position of the highest `1` bit in `Max_Prob_Value`'s
+binary representation.  This is equivalent to the largest integer `T` that satisfies
+`(1 << T) <= Max_Prob_Value`.
+
+Let `Large_Prob_Range = Max_Prob_Value - (1 << Prob_Base_Size) + 1`
+
+Let `Large_Prob_Start = (1 << Prob_Base_Size) - Large_Prob_Range`
+
+Read `Prob_Base_Size` bits from the bitstream as `Initial_Prob_Value`
+
+If `Initial_Prob_Value >= Large_Prob_Start`, then read 1 additional bit from
+the bitstream.  If that additional bit is `1`, then let
+`Prob_Value = Initial_Prob_Value + Large_Prob_Range`
+
+If there is no extra bit, or if the bit is 0, then let
+`Prob_Value = Initial_Prob_Value`
+
+If `Prob_Value` is zero, then `Probability` is a special "less than 1" value.
+The effects of the "less than 1" probability on the distribution table is
+described in the [next section].  In this case, let `Effective_Prob = 1`.
+
+If `Prob_Value` is non-zero, then let `Probability = Prob_Value - 1` and
+let `Effective_Prob = Probability`.
+
+If the `Probability` is zero, then it is followed by at least one repeat
+count in the bitstream.  Each repeat count is `2` bits.  Each time a repeat
+count of `3` is encountered, another repeat count is read until a repeat
+count other than `3` is encountered.  Once all repeat counts have been read,
+let `Symbol_Repeat_Count = Sum of all repeat counts for the symbol`.
+The `Probability` of the next `Symbol_Repeat_Count` symbols after the decoded
+symbol are zero, decoding of the probability values of those symbols is
+skipped, and the `Effective_Prob` of all skipped symbols is also zero.
+
+
+__Example__ :
+
+  Presuming an `Accuracy_Log` of 8, which allows a maximum cumulative 
+  effective probability of 256, and presuming 100 probabilities points
+  have already been distributed,
+  `Max_Prob_Value` is `(1 << 8) - 100 + 1 == 157`.
+  Therefore, `Prob_Base_Size` is `rounddown(log2(157)) == 7` bits.
+
   Presuming values from 0 to 157 (inclusive) are possible,
-  255-157 = 98 values are remaining in an 8-bits field.
-  They are used this way :
-  first 98 values (hence from 0 to 97) use only 7 bits,
-  values from 98 to 157 use 8 bits.
-  This is achieved through this scheme :
+  `Large_Prob_Range` is `157 - (1 << 7) + 1 == 30` and
+  `Large_Prob_Start` is `(1 << 7) - 30 == 98`.
 
-  | Value read | Value decoded | Number of bits used |
-  | ---------- | ------------- | ------------------- |
-  |   0 -  97  |   0 -  97     |  7                  |
-  |  98 - 127  |  98 - 127     |  8                  |
-  | 128 - 225  |   0 -  97     |  7                  |
-  | 226 - 255  | 128 - 157     |  8                  |
+  This results in the following mapping of input bits to probability:
 
-Symbols probabilities are read one by one, in order.
+  | First 7 bits | Additional bit | Decoded value | Total bits used |
+  | ------------ | -------------- | ------------- | --------------- |
+  |   0 -  97    | Not used       |  0 - 97       | 7               |
+  |  98 - 127    | 0              |  98 - 127     | 8               |
+  |  98 - 127    | 1              |  128 - 157    | 8               |
 
-Probability is obtained from Value decoded by following formula :
-`Proba = value - 1`
-
-It means value `0` becomes negative probability `-1`.
-`-1` is a special probability, which means "less than 1".
-Its effect on distribution table is described in the [next section].
-For the purpose of calculating total allocated probability points, it counts as one.
 
 [next section]:#from-normalized-distribution-to-decoding-tables
 
-When a symbol has a __probability__ of `zero`,
-it is followed by a 2-bits repeat flag.
-This repeat flag tells how many probabilities of zeroes follow the current one.
-It provides a number ranging from 0 to 3.
-If it is a 3, another 2-bits repeat flag follows, and so on.
-
-When last symbol reaches cumulated total of `1 << Accuracy_Log`,
-decoding is complete.
-If the last symbol makes cumulated total go above `1 << Accuracy_Log`,
-distribution is considered corrupted.
 If this process results in a non-zero probability for a value outside of the
 valid range of values that the FSE table is defined for, even if that value is
 not used, then the data is considered corrupted.
@@ -1134,7 +1152,7 @@ not used, then the data is considered corrupted.
 Then the decoder can tell how many bytes were used in this process,
 and how many symbols are present.
 The bitstream consumes a round number of bytes.
-Any remaining bit within the last byte is just unused.
+Any remaining bits within the last byte are unused.
 
 #### From normalized distribution to decoding tables
 
